@@ -1,0 +1,356 @@
+---
+title: "Survival"
+author: "xvalda"
+date: "23 July 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+## Summary
+
+The purpose of this document is to support the creation of a Shiny application that analyses, visualises and interprets survival data with various methods.     
+
+The app can be found here: https://xvalda.shinyapps.io/Survival/.   
+
+Survival analysis gathers a set of methods to answer to some questions such as:   
+- how much time it takes for an event to occur   
+- what is the probability for a patient to survive a certain amount of time, given a condition   
+- are there statistically significant differences in survival time between different patients groups   
+
+We'll clarify more concepts in the intuition section.   
+
+The dataset we're using is the "veteran" data from the survival package in R.   
+
+**Credits:**  
+- Data source: "D Kalbfleisch and RL Prentice (1980), The Statistical Analysis of Failure Time Data. Wiley, New York."   
+- We used several resources listed at the end of the document.    
+
+**Structure of the document:**  
+1. Load data and packages   
+2. Exploratory Data Analysis   
+3. Intuition about the survival theories     
+4. Kaplan-Meier Analytics   
+5. Cox proportional hazard models   
+6. Random Forests   
+7. Building the Shiny App   
+
+
+## 1. Load data and packages
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(survival); library(survminer); library(ranger); library(ggplot2); library(dplyr); library(ggfortify)
+data(veteran)
+str(veteran)
+```
+
+
+## 2. Exploratory data analysis
+
+The data provides from a randomized experiment between two treatment groups for lung cancer, it contains 137 observations of 8 variables:   
+- **trt:** 1 = standard, 2 = test    
+- **celltype:** factor describing the type of cell: 1=squamous, 2=smallcell, 3=adeno, 4=large   
+- **time:** survival time (from start of study to death), in days   
+- **status:** censoring status, 0 = patient death was not observed (survival time was censored), 1 = patient death was observed   
+- **karno:** Karnofsky performance score (quantifies cancer patients' general well-being and activities of daily life, 0 = Dead to 100 = Normal)      
+- **diagtime:**	time from diagnosis to randomisation, in months    
+- **age:** age of the patient in years   
+- **prior:** 0 = no prior therapy, 10 = prior therapy    
+
+We can transform two variables into factors: 
+```{r}
+veteran$trt <- factor(veteran$trt, labels = c("standard", "test"))
+veteran$prior <- factor(veteran$prior, labels = c("no", "yes"))
+```
+
+Summary statistics below show us among other things:   
+- even assignment in two treatment groups   
+- obviously right skewed distribution of time-to-event   
+- 6.6% of censored observations, 93.4% of patients died before the end of the study   
+- age ranges from 34 to 81 years old   
+- 30% of the subjects had a prior treatment   
+
+```{r}
+vet_temp <- veteran #assign veteran to temporary object (we want status variable to remain numerical and not factor for the rest of the project, but transform it here in a factor for a cleaner summary)
+vet_temp$status <- as.factor(vet_temp$status) #transform status as factor 
+summary(vet_temp)
+rm(vet_temp) #remove the object that we don't need now
+```
+
+
+We confirm the right skew we noticed in the summary statistics, and there isn't clear differentiating patterns between test or sandard treatment groups;     
+```{r}
+ggplot(data = veteran, aes(x = time, fill = trt)) + 
+  geom_histogram() + 
+  facet_grid(trt ~.) + 
+  ggtitle("Figure 1. Distribution of time-to-event by type of treatment")
+```
+
+We can explore the data further but we do not see obvious patterns, at least visually:  
+```{r}
+ggplot(data = veteran, aes(x = karno, fill = celltype)) + 
+  geom_histogram() + 
+  ggtitle("Figure 2. Type of karno per cell type")
+```
+
+A pairs plot is always useful, even when, like in this case, it doesn't show "interesting" correlations.   
+
+```{r}
+library(GGally)
+ggpairs(veteran)
+```
+
+Even though we do not find exploitable relations between variables at this stage, the above plots and summary statistics give us a better sense of the data, and we'll propose more interactive plotting options in the shiny app.   
+
+In order to make use of the time element of such a clinical trial study, we will use the different methods of survival analysis.    
+
+
+## 3. Intuition about survival analysis
+
+Survival analysis helps when the time element (an event occuring) is taken into account.   
+
+We want to estimate the time to reach a specific event.  
+
+Although very much used in clinical studies where the event is death or recurrence of a disease across two or more treatment groups, there are business/economical applications such as time from manufacturing a new machine component to the failure of this component, or lifetime of two different models of light bulbs, or estimating the time people remain unemployed, ...   
+
+### 3.1. Event
+The event is the endpoint in the study, the specific outcome we want to measure: death, relapse, mechanical component failure, ...   
+
+### 3.2. Censored Data
+
+This refers to incomplete data, the event did not occur for a subject during the time of the study, there are several cases:    
+- patient did not experience any event during the study, and we do not know if the event occured (for instance, we do not know if the patient ultimately survived or not after the study)   
+- Right censored subjects: the patient withdrew from the trial or data is lost for some reason (follow-up didn't occur on the patient, or the patient experienced a different event)   
+
+All patients not experiencing the event during the time of the study will be censored at the latest recorded time point.   
+
+### 3.3 Kaplan-Meier
+
+**Main purpose: visualing survival curves, works well with categorical data, for numerical data we'll use the Cox proportional hazard models**   
+
+After releasing similar findings, Edward Kaplan and Paul Meier published their joint work in 1958 about the non-parametric statistic (i.e. does not assume any underlying probability distribution).   
+
+Kaplan-Meier statistic measures the probability that a patient will survive past a specific point in time.   
+At t = 0, the statistic is 1 (or 100%).   
+When t increases infinitely, the statistic becomes 0.   
+
+The plot of the KM estimator is a series of decreasing horizontal steps, approaching the true survival function.    
+
+The **survival probability** of surviving after time = t is noted **S(t)**. It is the product of all the prior survival probabilities up to time = t.   
+
+S(t=n) = S(t=1) x S(t=2)  ... x S(t=n-1)   
+
+The basic formula is: 
+$$\LARGE \hat{S}(t) = \prod_{i: t_i <= t} (1-\frac{d_i}{n_i})$$
+
+t(i) is a time when at least an event happened, d(i) is the number of events (death or recurring disease for instance), that happend at time t(i), n(i) is the number of of individuals that survive (did not have an event or where not censored).    
+Source: https://en.wikipedia.org/wiki/Kaplan%E2%80%93Meier_estimator    
+
+This is based on conditional probabilities, each new proportion conditional on the previous proportions.   
+
+### 3.4. Log-Rank Test
+
+This test is performed on the curves of the Kaplan-Meier method.    
+For two (or more) different survival curves, it tests the null hypothesis that both curves are equal. If the p-value is below the significance level (generally alpha = 0.05), then we have convincing statistical evidence that at least two curves differ.   
+
+### 3.5. Cox proportional hazard models
+
+**Main purpose: describing the simultaneous effect of several variables on the rate of a particular event happening at a specific point in time. **   
+
+The Cox model is defined with the hazard function, h(t): it describes the probability of a hazard of a subject to survive to time = t. The function returns a proportion, from 0 to 1.     
+
+It measures the instaneous risk of death. It has a memory-less property, the likelihood of something happening at time = t has no relation to what happened in the past. The function at year y applies to all subjects alive that year, without taking into account who died in previous years.  
+
+The exponential survival distribution models the time until the event (component failure, ...).   
+
+Covariates are the predictors we use in the model that looks pretty much like a multiple linear regression.   
+
+
+$$hazard function: h(t) = h_0(t) * exp(b_1x_1 * b_2x_2 * ... * b_n x_n)$$
+
+- t = survival time  
+- h(t) = hazard function taking as arguments n covariates noted x1 to xn  
+- b1 ... bn = coefficients or weights of each covariate   
+- h0 = is the baseline hazard, i.e. value of the hazard when all x's are equal to zero.   
+
+Hazard ratios (log(b)) are noted HR:  
+- if HR = 1: no effect   
+- if HR < 1: reduction in hazard, we call the associated covariate a good prognostic factor   
+- if HR > 1: increase in hazard, we call the associated covariate a bas prognostic factor   
+
+
+### 3.6. Difference between survival and hazard functions
+
+The survivor function describes the probability of "not having an event", whereas the hazard function describes the probability of the event occurring.    
+
+The survival function is the probability that a subject survives from the time origin of the study to a specified future time t.   
+
+The hazard function is the probability that a subject under observation at a time t has an event at that time.  
+
+
+## 4. Kaplan-Meier Analytics
+
+We want to fit a survival curve for time until the event on the x-axis and status on the y-axis, with an explanatory variable like gender, type of treatment, ...   
+
+### 4.1. Fitting a Kaplan-Meier Model 
+
+We use the survfit() function from the survival package, in combination with the Surv() function, which provides a survival object containing failure time and censoring information.   
+
+In this first example, we use the treatment class (standard or test): 
+```{r}
+fit1 <- survfit(Surv(time, status) ~ trt, data=veteran)
+summary(fit1)$table
+```
+
+The short summary above shows that each treatment groups has the same events of 64 each, with a median survival time of 103 days for the standard treatment group and only 52.5 days for the test group.   
+
+### 4.2. Visualizing the model
+
+Although the autoplot(model_name) function provides the quickest way to visualize the survival curve, the ggsurvplot() from the Survminer package offers more options in just one plot: 
+
+```{r}
+ggsurvplot(
+  fit1,                     #survival model we want to plot 
+  pval = TRUE,              #displays p-value of log-rank test, if p-value < 0.05, then the difference between the two curves are statistically significant
+  conf.int = TRUE,          #plots a confidence interval for each curve
+  xlab = "Time in days",
+  break.time.by = 150,      # break X axis in time intervals by 100.
+  ggtheme = theme_light(),  # customize theme with a grid for better readability 
+  risk.table = "abs_pct",   # absolute number and percentage at risk
+  risk.table.y.text.col = T,# colour risk table text annotations
+  risk.table.y.text = FALSE,# show bars instead of names in text annotations
+                            # in legend of risk table.
+  ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+  surv.median.line = "hv"   # add the median survival pointer
+)
+```
+
+Interpretation:   
+- The x-axis represents the survival time in days.   
+- The y-axis shows the probability of survival time, related to the number of days on the x-axis.   
+- Each event (death in this case) is shown by a vertical drop of the curve.   
+- Vertical ticks (although hardly noticeable on the plot) show a censored patient.   
+- The curve always start at 1 (no events occured or in this case all patients are alive), then decreases and if the study would last infinitely, the curve would tend towards 0 (no subjects left due to event or censoring).   
+- The p-value is 0.93, which is extremely high, we fail to reject the null hypothesis that both curves are different, in plain language, there is no statistical evidence that both curves are different OR, the treatment type doesn't impact the survival time.   
+- Like stated earlier and visible here, the median survival time (the point where survival probability is 0.5) for standard treatment is 103 days, against only 52.5 days for the test treatment. However, the log-rank test shows a very high p-value, so even though the differences in medians seems large, there is no strong statistical evidence (actually very weak evidence in this case) that both curves are different.   
+
+### 4.3. Transforming the survival curve
+
+There is another major argument of the ggsurvplot() function, "fun", which proposes alternative transformations:   
+
+- "log": log transformation of the survivor function,   
+```{r}
+ggsurvplot(fit1,
+          conf.int = TRUE,
+          ggtheme = theme_bw(), 
+          fun = "log")
+```
+
+- "event": plots cumulative events (f(y) = 1-y). It's also known as the cumulative incidence,   
+```{r}
+ggsurvplot(fit1,
+          conf.int = TRUE,
+          ggtheme = theme_bw(), 
+          fun = "event")
+```
+
+- "cumhaz" plots the cumulative hazard function (f(y) = -log(y))    
+The cummulative hazard is commonly used to estimate the hazard probability.   
+It's defined as H(t)=???log(survivalfunction)=???log(S(t)). The cumulative hazard (H(t)) can be interpreted as the cumulative force of mortality. In other words, it corresponds to the number of events that would be expected for each individual by time t if the event were a repeatable process.   
+```{r}
+ggsurvplot(fit1,
+          conf.int = TRUE,
+          ggtheme = theme_bw(), 
+          fun = "cumhaz")
+```
+
+### 4.4. Fitting several surival curves
+
+
+
+## 5. Cox proportional hazard models   
+
+### 5.1. Fitting a Cox Model
+
+We use the coxph() function from the survival package.  
+
+**Fit univariate model**
+```{r}
+fit_cox_uni <- coxph(Surv(time, status) ~ trt, data = veteran)
+summary(fit_cox_uni)
+```
+
+Interpreting the summary output:   
+
+- **The "z" column gives the Wald statistic value** (ratio of each regression coefficient to its standard error (z = coef/se(coef)). The wald statistic evaluates, whether the beta coefficient of a given variable is statistically significantly different from 0. With z = 0.098 and p = 0.922, type of treatment doesn't have any statistically significant coefficients.   
+
+**It the regression coefficients (coef) has a positive sign**, the hazard (risk of death) is higher, i.e. the prognosis is worse, for subjects with higher values of that variable. The output gives the hazard ratio (HR) for the second group relative to the first group, that is, test treatment versus standard. The beta coefficient for trt = 0.01774 indicates that test patients have higher risk of death (higher survival rates) than standard patients. But let's keep in mind that the p-value was high and the variable itself is not statistically significant.   
+
+**Hazard ratios **, that is the exponentiated coefficients noted (exp(coef) = exp(0.01774) = 1.02), give the effect size of the covariates. For example, having test treatment increases the hazard by a factor of 1.02.   
+
+**Upper and lower 95% confidence intervals** for the hazard ratio (exp(coef)).   
+
+**The global statistical significance of the model** gives p-values for three tests: likelihood-ratio test, Wald test, and score logrank. These three methods test the null hypothesis that all beta vaues are zero and are asymptotically equivalent. For large n, they return similar results. For small n, we use the likelihood ratio test.   
+
+**Fit multivariate model**
+```{r}
+fit_cox_multi <- coxph(Surv(time, status) ~ ., data = veteran)
+summary(fit_cox_multi)
+```
+
+Interpretation:   
+- the 3 p-values of the global statistical significance are similar and show that the model is statistically significant (p-value < 0.05).   
+- cell type and karno seem to be the most significant variables   
+
+```{r}
+ggsurvplot(survfit(fit_cox_multi, data = veteran), ggtheme = theme_minimal())
+```
+
+
+## 6. Shiny Application
+
+### 6.1. Requirements for current shiny app
+
+The shiny app is targeted at researchers, laboratories and physicians alike.   
+
+App Features:   
+- Tab 1: **Introduction and dataset**, Introduction and presentation of the dataset, details about the dataset and codebook.   
+- Tab 2: **Basic Data Exploration **, Basic data exploration, the user can have basic summary statistics of the variables and a few plots (histogram and scatterplot) in order to get a better feel of the data.   
+- tab 3: **Survival Curve**, Kaplan Meier survival curve, users can filter and modify the plot.   
+- tab 4: **Full Model Summary**, full output of the model.   
+- tab 5: **Reference**: intuition about survival analysis, references/credits, contact details.    
+
+### 6.2. Plans for a second iteration of the app
+
+Potential further developments are:   
+- archiving more datasets   
+- allowing user to import own dataset, user will need to enter the name of the outcome variable    
+- more sophisticated plotting options   
+- more algorithms (Cox Proportional Hazard Model)     
+- option to export a pdf report   
+
+### 6.3 Links 
+Shiny app: https://xvalda.shinyapps.io/Survival/    
+Github: https://github.com/xvalda/Survival-Analysis    
+
+
+## References
+
+In order to compile this introduction to survival analysis, We used resources, some of them extensively:    
+- http://www.sthda.com/english/wiki/cox-proportional-hazards-model   
+- http://www.sthda.com/english/wiki/cox-model-assumptions   
+- http://www.statisticshowto.com/survival-analysis/   
+- https://www.openintro.org/download.php?file=survival_analysis_in_R   
+- http://www.ms.uky.edu/~mai/Rsurv.pdf   
+
+## Contact details
+
+For questions, requests for further developments, maintenance issues or any comment, please feel free to reach out, indicating it relates to the "Survival Shiny App":   
+- xavier@measuringsocial.com   
+- www.linkedin.com/in/xavier-valdayron-9707231
+   
+
+
+
